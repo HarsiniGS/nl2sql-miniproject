@@ -1,4 +1,6 @@
 require("dotenv").config();
+//console.log("GROQ KEY:", process.env.GROQ_API_KEY ? "FOUND" : "NOT FOUND");
+
 const express = require("express");
 const cors = require("cors");
 const Database = require("better-sqlite3");
@@ -18,36 +20,54 @@ const groq = new Groq({
   apiKey: process.env.GROQ_API_KEY,
 });
 
+// ================= CLEAN SQL =================
+function cleanSQL(sql) {
+  return sql
+    .replace(/```sql/g, "")
+    .replace(/```/g, "")
+    .replace(/;\s*$/g, "")
+    .trim();
+}
+
 // ================= NL → SQL =================
 async function convertQuestionToSQL(question) {
   const prompt = `
 You are an AI that converts natural language into SQL.
 
-Rules:
+IMPORTANT RULES:
+- Always use SINGLE QUOTES for strings (example: 'Zoho')
+- Never use double quotes for values
 - Allowed: SELECT, INSERT, UPDATE, DELETE
-- SELECT may include JOIN between students and placements
 - Never generate DROP, ALTER, TRUNCATE
-- Tables:
-  students(student_id, student_name, department, cgpa, email)
-  placements(id, student_name, department, package_lpa, company_name, year)
+- Return ONLY SQL query without markdown or explanation
 
-Return ONLY SQL query.
+Tables:
+students(student_id, student_name, department, cgpa, email)
+placements(id, student_name, department, package_lpa, company_name, year)
 
 Question: ${question}
 `;
 
+  console.log("Sending request to Groq...");
+
   const response = await groq.chat.completions.create({
-    model: "openai/gpt-oss-120b",
+    model: "llama-3.1-8b-instant",
     messages: [{ role: "user", content: prompt }],
+    temperature: 0.2,
+    stream: false, // IMPORTANT FIX for Node 22 stability
   });
 
-  return response.choices[0].message.content.trim();
+  console.log("Groq response received");
+
+  let sql = response.choices[0].message.content;
+  sql = cleanSQL(sql);
+
+  return sql;
 }
 
 // ================= API =================
 app.post("/api/ask", async (req, res) => {
   try {
-
     const question = req.body.question;
 
     if (!question || !question.trim()) {
@@ -92,7 +112,7 @@ app.post("/api/ask", async (req, res) => {
     let rows = [];
     let tableName = "";
 
-    // ===== Block dangerous queries =====
+    // ================= SAFETY CHECK =================
     if (
       lowerSQL.includes("drop") ||
       lowerSQL.includes("alter") ||
@@ -108,39 +128,40 @@ app.post("/api/ask", async (req, res) => {
 
     // ================= SELECT =================
     if (lowerSQL.startsWith("select")) {
-
-      rows = db.prepare(generatedSQL).all();
-
+      try {
+        rows = db.prepare(generatedSQL).all();
+      } catch (err) {
+        console.log("SQL Error:", err.message);
+        return res.json({
+          sql: generatedSQL,
+          columns: [],
+          rows: [],
+          message: "❌ Invalid SQL generated",
+        });
+      }
     }
 
     // ================= INSERT =================
     else if (lowerSQL.startsWith("insert")) {
-
       if (lowerSQL.includes("students")) tableName = "students";
       if (lowerSQL.includes("placements")) tableName = "placements";
 
       const match = generatedSQL.match(/values\s*\((.*)\)/i);
 
       if (match) {
-
         let values = match[1]
           .split(",")
           .map(v => v.trim().replace(/['"]/g, ""));
 
-        // ===== STUDENTS =====
+        // STUDENTS
         if (tableName === "students") {
-
           let [student_name, department, cgpa, email] = values;
-
-          student_name = student_name.toLowerCase();
-          department = department.toLowerCase();
-          email = email.toLowerCase();
 
           const existing = db.prepare(`
             SELECT * FROM students
             WHERE LOWER(student_name) = ?
             OR LOWER(email) = ?
-          `).get(student_name, email);
+          `).get(student_name.toLowerCase(), email.toLowerCase());
 
           if (existing) {
             return res.json({
@@ -155,24 +176,18 @@ app.post("/api/ask", async (req, res) => {
             INSERT INTO students (student_name, department, cgpa, email)
             VALUES (?, ?, ?, ?)
           `).run(student_name, department, cgpa, email);
-
         }
 
-        // ===== PLACEMENTS =====
+        // PLACEMENTS
         if (tableName === "placements") {
-
           let [student_name, department, package_lpa, company_name, year] = values;
-
-          student_name = student_name.toLowerCase();
-          department = department.toLowerCase();
-          company_name = company_name.toLowerCase();
 
           const existing = db.prepare(`
             SELECT * FROM placements
             WHERE LOWER(student_name) = ?
             AND LOWER(company_name) = ?
             AND year = ?
-          `).get(student_name, company_name, year);
+          `).get(student_name.toLowerCase(), company_name.toLowerCase(), year);
 
           if (existing) {
             return res.json({
@@ -188,20 +203,16 @@ app.post("/api/ask", async (req, res) => {
             (student_name, department, package_lpa, company_name, year)
             VALUES (?, ?, ?, ?, ?)
           `).run(student_name, department, package_lpa, company_name, year);
-
         }
-
       }
 
       if (tableName) {
         rows = db.prepare(`SELECT * FROM ${tableName}`).all();
       }
-
     }
 
     // ================= UPDATE =================
     else if (lowerSQL.startsWith("update")) {
-
       if (lowerSQL.includes("students")) tableName = "students";
       if (lowerSQL.includes("placements")) tableName = "placements";
 
@@ -210,12 +221,10 @@ app.post("/api/ask", async (req, res) => {
       if (tableName) {
         rows = db.prepare(`SELECT * FROM ${tableName}`).all();
       }
-
     }
 
     // ================= DELETE =================
     else if (lowerSQL.startsWith("delete")) {
-
       if (lowerSQL.includes("students")) tableName = "students";
       if (lowerSQL.includes("placements")) tableName = "placements";
 
@@ -224,19 +233,16 @@ app.post("/api/ask", async (req, res) => {
       if (tableName) {
         rows = db.prepare(`SELECT * FROM ${tableName}`).all();
       }
-
     }
 
     // ================= INVALID =================
     else {
-
       return res.json({
         sql: generatedSQL,
         columns: [],
         rows: [],
         message: "❌ Only SELECT, INSERT, UPDATE, DELETE allowed",
       });
-
     }
 
     // ================= RESPONSE =================
@@ -252,7 +258,6 @@ app.post("/api/ask", async (req, res) => {
     });
 
   } catch (err) {
-
     console.error(err);
 
     res.status(500).json({
@@ -261,7 +266,6 @@ app.post("/api/ask", async (req, res) => {
       rows: [],
       message: "Server error",
     });
-
   }
 });
 
